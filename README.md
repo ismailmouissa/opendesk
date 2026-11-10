@@ -9,7 +9,13 @@ No account, no subscription, no API key, no server.
   two timeframes and gives one answer: BUY, SELL or WAIT, with entry, stop loss, TP1 and TP2, position size,
   the reasons for and against, and discipline warnings (daily loss limit, too many open trades, revenge trading).
   "Find the best trade now" ranks all markets.
-- **Scanner** — scans 8 markets (BTC, ETH, SOL, BNB, XRP, ADA, gold via PAXG, EUR/USD) on 15m / 1h / 4h / 1d
+- **Markets** — 11 forex pairs (EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CAD, USD/CHF, EUR/JPY, EUR/GBP, AUD/JPY,
+  AUD/CAD, GBP/JPY), gold and 6 crypto coins. Sizes are also shown as MT5 lots with the stop distance in pips.
+- **News** — high-impact releases from the economic calendar for the pair's currencies are listed on every
+  analysis, and scalp/intraday trades are locked from 30 minutes before to 15 minutes after a release.
+  A GitHub Action (`.github/workflows/calendar.yml`) refreshes `calendar.json` every 4 hours.
+  It covers scheduled data only; it does not read headlines.
+- **Scanner** — scans every market on 15m / 1h / 4h / 1d
   with three published rule sets (Breakout, Trend Pullback, Range Reversal). Each signal shows entry,
   structural stop, target, a confluence score and the reasons it fired.
 - **Position sizing** — every signal is sized to your equity and your per-trade risk %.
@@ -33,7 +39,9 @@ To put it online for free, upload `index.html` to GitHub Pages, Netlify or Cloud
 
 ## Data and privacy
 
-Market data comes from Binance's public API (`data-api.binance.vision`), which needs no key.
+Market data comes from the public Kraken API (forex; AUD/CAD and GBP/JPY are built from two legs) and
+Binance API (crypto, gold via PAXG). Neither needs a key. The calendar is Forex Factory's weekly export.
+Feed prices can differ from your broker's by a few pips.
 Your settings and trades are stored in your browser's `localStorage` and never leave your device.
 Use Settings → Export JSON to back them up.
 

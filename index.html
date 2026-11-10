@@ -180,26 +180,34 @@ h4{margin:22px 0 8px;font-size:14px}
   </div>
 </section>
 
-<p class="note">OpenDesk is free, open-source educational software (MIT). Signals are mechanical rule outputs, not financial advice, and can be wrong. Market data: Binance public API.</p>
+<p class="note">OpenDesk is free, open-source educational software (MIT). Signals are mechanical rule outputs, not financial advice, and can be wrong. News coverage is the scheduled economic calendar only — it does not read headlines. Data: Kraken (forex), Binance (crypto, gold), Forex Factory calendar.</p>
 </main>
 
 <script>
 'use strict';
 const API = 'https://data-api.binance.vision/api/v3';
+const KAPI = 'https://api.kraken.com/0/public';
+const CAL_URLS = ['https://raw.githubusercontent.com/ismailmouissa/opendesk/main/calendar.json', 'calendar.json'];
+// src: undefined = Binance, 'k' = Kraken forex, 'x' = cross built from two Kraken legs. lot = MT5 contract size.
+const fx = (b, q, extra = {}) => ({s: b + q, n: b + '/' + q, a: [(b + q).toLowerCase(), (b + '/' + q).toLowerCase(), (b + ' ' + q).toLowerCase()], g: 'Forex', cur: [b, q], lot: 1e5, src: 'k', ...extra});
 const MARKETS = [
-  {s:'BTCUSDT', n:'Bitcoin', a:['btc','bitcoin']},
-  {s:'ETHUSDT', n:'Ethereum', a:['eth','ethereum']},
-  {s:'SOLUSDT', n:'Solana', a:['sol','solana']},
-  {s:'BNBUSDT', n:'BNB', a:['bnb']},
-  {s:'XRPUSDT', n:'XRP', a:['xrp','ripple']},
-  {s:'ADAUSDT', n:'Cardano', a:['ada','cardano']},
-  {s:'PAXGUSDT', n:'Gold (PAXG)', a:['gold','xau','paxg']},
-  {s:'EURUSDT', n:'Euro / USD', a:['eur','euro','eurusd']},
+  fx('EUR', 'USD', {a: ['eurusd', 'eur/usd', 'eur usd', 'euro']}), fx('GBP', 'USD', {a: ['gbpusd', 'gbp/usd', 'gbp usd', 'cable', 'pound']}),
+  fx('USD', 'JPY'), fx('AUD', 'USD'), fx('USD', 'CAD'), fx('USD', 'CHF'), fx('EUR', 'JPY'), fx('EUR', 'GBP'), fx('AUD', 'JPY'),
+  fx('AUD', 'CAD', {src: 'x', legs: ['AUDUSD', 'USDCAD']}), fx('GBP', 'JPY', {src: 'x', legs: ['GBPUSD', 'USDJPY']}),
+  {s:'PAXGUSDT', n:'Gold (XAU/USD)', a:['gold','xau','xauusd','paxg'], g:'Metals', cur:['USD'], lot:100},
+  {s:'BTCUSDT', n:'Bitcoin', a:['btc','bitcoin'], g:'Crypto', cur:['USD']},
+  {s:'ETHUSDT', n:'Ethereum', a:['eth','ethereum'], g:'Crypto', cur:['USD']},
+  {s:'SOLUSDT', n:'Solana', a:['sol','solana'], g:'Crypto', cur:['USD']},
+  {s:'BNBUSDT', n:'BNB', a:['bnb'], g:'Crypto', cur:['USD']},
+  {s:'XRPUSDT', n:'XRP', a:['xrp','ripple'], g:'Crypto', cur:['USD']},
+  {s:'ADAUSDT', n:'Cardano', a:['ada','cardano'], g:'Crypto', cur:['USD']},
 ];
+const MK = Object.fromEntries(MARKETS.map(m => [m.s, m]));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 const KEY = 'opendesk.v1';
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const fmt = p => { if (p == null || !isFinite(p)) return '—'; const a = Math.abs(p); return p.toLocaleString('en-US', {maximumFractionDigits: a >= 1000 ? 1 : a >= 10 ? 2 : a >= 1 ? 4 : 5}); };
+const fmt = p => { if (p == null || !isFinite(p)) return '—'; const a = Math.abs(p); return p.toLocaleString('en-US', {maximumFractionDigits: a >= 1000 ? 1 : a >= 100 ? 3 : a >= 10 ? 2 : 5}); };
 const usd = v => (v < 0 ? '-$' : '$') + Math.abs(v).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
 const nameOf = s => (MARKETS.find(m => m.s === s) || {n: s}).n;
 
@@ -215,20 +223,78 @@ let prices = {};        // symbol -> last price
 let lastScan = [];      // latest analysis results
 
 /* ---------- market data ---------- */
-async function klines(sym, tf, limit = 300) {
+const kCache = {};
+function klines(sym, tf, limit = 300) {            // 45-second cache so crosses and repeat calls share requests
+  const key = sym + tf, c = kCache[key];
+  if (c && Date.now() - c.t < 45000) return c.p;
+  const p = rawKlines(sym, tf, limit); kCache[key] = {t: Date.now(), p}; p.catch(() => delete kCache[key]); return p;
+}
+let kQueue = Promise.resolve();                      // Kraken's public API is rate-limited: one request at a time
+function kraken(sym, tf, limit) {
+  const run = async () => {
+    for (let i = 0; ; i++) {
+      const j = await (await fetch(`${KAPI}/OHLC?pair=${sym}&interval=${{'15m': 15, '1h': 60, '4h': 240, '1d': 1440}[tf]}`)).json();
+      if (j.error && j.error.length) { if (i < 2) { await sleep(2000 * (i + 1)); continue; } throw new Error('Forex data unavailable (' + j.error[0] + ')'); }
+      const rows = Object.entries(j.result).find(([k]) => k !== 'last')[1];
+      return rows.slice(-limit).map(k => ({t: k[0] * 1000, o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[6]}));
+    }
+  };
+  const p = kQueue.then(run, run); kQueue = p.then(() => sleep(350), () => sleep(350)); return p;
+}
+async function rawKlines(sym, tf, limit) {
+  const m = MK[sym] || {};
+  if (m.src === 'k') return kraken(sym, tf, limit);
+  if (m.src === 'x') {                               // synthetic cross, e.g. AUD/CAD = AUD/USD × USD/CAD (wicks are approximated)
+    const [A, B] = await Promise.all(m.legs.map(l => klines(l, tf, limit))), mb = new Map(B.map(x => [x.t, x]));
+    return A.filter(a => mb.has(a.t)).map(a => {
+      const b = mb.get(a.t), o = a.o * b.o, c = a.c * b.c;
+      const up = ((a.h - Math.max(a.o, a.c)) / a.c + (b.h - Math.max(b.o, b.c)) / b.c) / 2, dn = ((Math.min(a.o, a.c) - a.l) / a.c + (Math.min(b.o, b.c) - b.l) / b.c) / 2;
+      return {t: a.t, o, h: Math.max(o, c) * (1 + up), l: Math.min(o, c) * (1 - dn), c, v: 0};
+    });
+  }
   const r = await fetch(`${API}/klines?symbol=${sym}&interval=${tf}&limit=${limit}`);
   if (!r.ok) throw new Error('Market data unavailable (' + r.status + ')');
   return (await r.json()).map(k => ({t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5]}));
 }
 async function refreshPrices() {
   try {
-    const q = encodeURIComponent(JSON.stringify(MARKETS.map(m => m.s)));
+    const q = encodeURIComponent(JSON.stringify(MARKETS.filter(m => !m.src).map(m => m.s)));
     const r = await fetch(`${API}/ticker/price?symbols=${q}`);
-    if (!r.ok) return;
-    for (const t of await r.json()) prices[t.symbol] = +t.price;
-    checkExits(); renderPortfolio();
+    if (r.ok) for (const t of await r.json()) prices[t.symbol] = +t.price;
   } catch (e) {}
+  try {
+    const j = await (await fetch(`${KAPI}/Ticker?pair=${MARKETS.filter(m => m.src === 'k').map(m => m.s).join(',')}`)).json();
+    for (const [k, v] of Object.entries(j.result || {})) prices[k.length === 8 ? k.slice(1, 4) + k.slice(5, 8) : k] = +v.c[0];
+    for (const m of MARKETS) if (m.src === 'x' && prices[m.legs[0]] && prices[m.legs[1]]) prices[m.s] = prices[m.legs[0]] * prices[m.legs[1]];
+  } catch (e) {}
+  checkExits(); renderPortfolio();
 }
+// Profit and loss is earned in the quote currency; convert it to the USD account.
+function q2usd(sym) {
+  const cur = (MK[sym] || {}).cur, q = cur ? cur[cur.length - 1] : 'USD', p = prices;
+  return q === 'USD' ? 1 : q === 'JPY' ? 1 / p.USDJPY : q === 'CAD' ? 1 / p.USDCAD : q === 'CHF' ? 1 / p.USDCHF : q === 'GBP' ? p.GBPUSD : q === 'AUD' ? p.AUDUSD : 1;
+}
+
+/* ---------- news: high-impact economic calendar + crypto sentiment ---------- */
+let CAL = null, calStale = true, FNG = null;
+async function loadNews() {
+  for (const u of CAL_URLS) {
+    try {
+      const r = await fetch(u, {cache: 'no-store'}); if (!r.ok) continue;
+      const j = await r.json(); if (!j || !Array.isArray(j.events)) continue;
+      CAL = j.events.filter(e => e.impact === 'High').map(e => ({t: Date.parse(e.date), cur: e.country, title: e.title, f: e.forecast, p: e.previous})).filter(e => e.t);
+      calStale = !(Date.now() - Date.parse(j.updated) < 3 * 864e5); break;
+    } catch (e) {}
+  }
+  try { const j = await (await fetch('https://api.alternative.me/fng/?limit=1')).json(); FNG = j.data[0]; } catch (e) {}
+}
+const when = t => { const d = t - Date.now(), m = Math.round(Math.abs(d) / 6e4), s = m >= 60 ? Math.floor(m / 60) + 'h ' + (m % 60) + 'm' : m + 'm'; return d >= 0 ? 'in ' + s : s + ' ago'; };
+function newsFor(sym, hours) {
+  if (!CAL || calStale) return null;
+  const cur = sym ? (MK[sym] || {}).cur || [] : null, now = Date.now();
+  return CAL.filter(e => (!cur || cur.includes(e.cur)) && e.t > now - 36e5 && e.t < now + hours * 36e5).sort((a, b) => a.t - b.t);
+}
+const newsLine = e => `${e.cur} · ${e.title} · ${when(e.t)}${e.f ? ` (forecast ${e.f}${e.p ? ', previous ' + e.p : ''})` : ''}`;
 
 /* ---------- indicators ---------- */
 function ema(v, n) { const k = 2 / (n + 1), out = []; let e = v[0]; for (let i = 0; i < v.length; i++) { e = i ? v[i] * k + e * (1 - k) : v[0]; out.push(e); } return out; }
@@ -327,6 +393,7 @@ async function deep(sym, style) {
   const c = k.map(x => x.c), e20 = ema(c, 20)[n], e50 = ema(c, 50)[n], e200 = ema(c, 200)[n], r = rsi(c)[n], a = atr(k)[n], mh = macd(c), ax = adx(k);
   const hc = hiAll.slice(0, -1).map(x => x.c), hn = hc.length - 1, h50 = ema(hc, 50)[hn], h200 = ema(hc, 200)[hn], hm = macd(hc)[hn];
   prices[sym] = price;
+  if (!isFinite(q2usd(sym))) await refreshPrices();
   const F = [], add = (p, t) => F.push({p, t});
   // 1-2: higher timeframe
   if (h50 > h200 && hc[hn] > h200) add(3, `${sp.hi} trend is up (EMA50 above EMA200, price above it)`);
@@ -359,7 +426,7 @@ async function deep(sym, style) {
   else if (upW > 2 * body && loW < body && body > 0) add(-1, 'Bearish rejection wick (pin bar)');
   // 9: volume
   const volAvg = k.slice(n - 20, n).reduce((s, x) => s + x.v, 0) / 20;
-  if (last.v > 1.3 * volAvg && last.c !== last.o) add(last.c > last.o ? .5 : -.5, `Above-average volume on a ${last.c > last.o ? 'bullish' : 'bearish'} candle`);
+  if (MK[sym].g !== 'Forex' && last.v > 1.3 * volAvg && last.c !== last.o) add(last.c > last.o ? .5 : -.5, `Above-average volume on a ${last.c > last.o ? 'bullish' : 'bearish'} candle`);
   // 10: key levels
   const P = [...H, ...L], below = P.filter(p => p < price - .3 * a), above = P.filter(p => p > price + .3 * a);
   const sup = below.length ? Math.max(...below) : price - 2 * a, res = above.length ? Math.min(...above) : price + 2 * a;
@@ -367,27 +434,38 @@ async function deep(sym, style) {
   if (price - sup < .8 * a) add(1.5, `Support at ${fmt(sup)} is right below`);
 
   const score = F.reduce((s, f) => s + f.p, 0), ranging = ax < 18, thr = ranging ? 4.5 : 3.5;
-  const verdict = score >= thr ? 'BUY' : score <= -thr ? 'SELL' : 'WAIT';
+  let verdict = score >= thr ? 'BUY' : score <= -thr ? 'SELL' : 'WAIT';
+  // News: list high-impact events for this market's currencies; lock short-term trades around a release.
+  const news = newsFor(sym, {scalp: 3, intraday: 12, swing: 48}[style] || 12);
+  const hit = news && style !== 'swing' && news.find(e => e.t - Date.now() < 30 * 6e4 && e.t - Date.now() > -15 * 6e4);
+  const lock = hit && verdict !== 'WAIT' ? `News lock: ${hit.cur} ${hit.title} ${when(hit.t)}. The chart said ${verdict}, but do not open a trade until 15 minutes after the release.` : '';
+  if (lock) verdict = 'WAIT';
   const mk = (side, entry, anchor) => {
     const long = side === 'BUY'; let stop = long ? anchor - .3 * a : anchor + .3 * a;
     const d = Math.min(Math.max(Math.abs(entry - stop), a), 3 * a); stop = long ? entry - d : entry + d;
     return {side, entry, stop, tp1: long ? entry + 1.5 * d : entry - 1.5 * d, tp2: long ? entry + 2.5 * d : entry - 2.5 * d};
   };
-  const out = {sym, style, sp, price, verdict, score, ranging, adx: ax, rsi: r, atr: a, F, sup, res, closes: c.slice(-80), time: Date.now(),
+  const out = {sym, style, sp, price, verdict, score, ranging, news, lock, adx: ax, rsi: r, atr: a, F, sup, res, closes: c.slice(-80), time: Date.now(),
     conf: Math.min(92, Math.round(50 + Math.abs(score) / 11 * 42))};
   if (verdict === 'BUY') { const sw = lastSwing(k, 'low'); out.plan = mk('BUY', price, sw != null && sw < price ? sw : sup); if (res < out.plan.tp1) out.warn = `Resistance at ${fmt(res)} sits before TP1 — expect a reaction there.`; }
   else if (verdict === 'SELL') { const sw = lastSwing(k, 'high'); out.plan = mk('SELL', price, sw != null && sw > price ? sw : res); if (sup > out.plan.tp1) out.warn = `Support at ${fmt(sup)} sits before TP1 — expect a reaction there.`; }
   else { out.buyTrig = mk('BUY', res, res - 1.2 * a); out.sellTrig = mk('SELL', sup, sup + 1.2 * a); }
   return out;
 }
+function newsText(d) {
+  const cur = MK[d.sym].cur.join(' / '), fng = MK[d.sym].g === 'Crypto' && FNG ? `\nCrypto Fear & Greed index: ${FNG.value} (${FNG.value_classification}).` : '';
+  if (!d.news) return 'News: calendar unavailable — check an economic calendar yourself before entering.' + fng;
+  if (!d.news.length) return `News: no high-impact ${cur} release in this trade's window.` + fng;
+  return `News (high impact, ${cur}):\n` + d.news.map(e => '• ' + newsLine(e)).join('\n') + '\nExpect a spike around each release: be flat or have the stop at entry before it.' + fng;
+}
 function deepText(d) {
   const head = `${nameOf(d.sym)} — ${d.sp.n} (${d.sp.lo} + ${d.sp.hi}) · price ${fmt(d.price)}`;
   const pro = d.F.filter(f => f.p > 0).map(f => '+ ' + f.t), con = d.F.filter(f => f.p < 0).map(f => '− ' + f.t);
   const why = `\n\nFor a buy:\n${pro.join('\n') || '(nothing)'}\n\nFor a sell:\n${con.join('\n') || '(nothing)'}\n\nSupport ${fmt(d.sup)} · Resistance ${fmt(d.res)} · ADX ${d.adx.toFixed(0)}${d.ranging ? ' (ranging market)' : ''}`;
-  if (!d.plan) return `${head}\n\nVERDICT: WAIT — the factors disagree (score ${d.score.toFixed(1)}), no trade right now.\n\nAct only on a trigger:\n• BUY if a ${d.sp.lo} candle closes above ${fmt(d.res)} → SL ${fmt(d.buyTrig.stop)}, TP1 ${fmt(d.buyTrig.tp1)}, TP2 ${fmt(d.buyTrig.tp2)}\n• SELL if a ${d.sp.lo} candle closes below ${fmt(d.sup)} → SL ${fmt(d.sellTrig.stop)}, TP1 ${fmt(d.sellTrig.tp1)}, TP2 ${fmt(d.sellTrig.tp2)}` + why;
-  const p = d.plan, z = sizeFor(p.entry, p.stop), blocked = S.settings.spotOnly && p.side === 'SELL';
+  if (!d.plan) return `${head}\n\nVERDICT: WAIT — ${d.lock || `the factors disagree (score ${d.score.toFixed(1)}), no trade right now.`}\n\n${newsText(d)}\n\nAct only on a trigger:\n• BUY if a ${d.sp.lo} candle closes above ${fmt(d.res)} → SL ${fmt(d.buyTrig.stop)}, TP1 ${fmt(d.buyTrig.tp1)}, TP2 ${fmt(d.buyTrig.tp2)}\n• SELL if a ${d.sp.lo} candle closes below ${fmt(d.sup)} → SL ${fmt(d.sellTrig.stop)}, TP1 ${fmt(d.sellTrig.tp1)}, TP2 ${fmt(d.sellTrig.tp2)}` + why;
+  const p = d.plan, z = sizeFor(p.entry, p.stop, d.sym), blocked = S.settings.spotOnly && p.side === 'SELL';
   return `${head}\n\nVERDICT: ${p.side} — confidence ${d.conf}/100\nEntry ${fmt(p.entry)}\nStop loss ${fmt(p.stop)}\nTP1 ${fmt(p.tp1)} (1.5R) — take half, move stop to entry\nTP2 ${fmt(p.tp2)} (2.5R)` + (d.warn ? '\n' + d.warn : '') + (guard(d.sym) ? '\n⚠ ' + guard(d.sym) : '') +
-    (blocked ? '\nSpot-only mode is on: do not short — simply stay out of this market.' : `\nSize at ${S.settings.riskPct}% risk: ${fmt(z.qty)} units ≈ ${usd(z.notional)}, risking ${usd(z.risk)}.${z.note ? ' ' + z.note : ''}`) + why;
+    (blocked ? '\nSpot-only mode is on: do not short — simply stay out of this market.' : '\n' + sizeLine(z)) + '\n\n' + newsText(d) + why;
 }
 let lastDeep = null;
 // Discipline rules a consistent trader follows; returned as a warning when one is broken.
@@ -405,15 +483,15 @@ function reportHTML(d) {
   const lv = (x, lab) => `<div class="lv"><div><small>${lab}</small><b>${fmt(x.entry)}</b></div><div><small>Stop loss</small><b class="down">${fmt(x.stop)}</b></div><div><small>TP1 · TP2</small><b class="up">${fmt(x.tp1)} · ${fmt(x.tp2)}</b></div></div>`;
   const p = d.plan; let body, chart;
   if (p) {
-    const z = sizeFor(p.entry, p.stop), blocked = S.settings.spotOnly && p.side === 'SELL';
+    const z = sizeFor(p.entry, p.stop, d.sym), blocked = S.settings.spotOnly && p.side === 'SELL';
     chart = spark({closes: d.closes, setup: 1, stop: p.stop, target: p.tp2});
     body = lv(p, 'Entry (now)') + `<p style="margin:0 0 6px">Take half off at TP1 (1.5R) and move the stop to entry; let the rest run to TP2 (2.5R).${d.warn ? ' <span style="color:var(--warn)">' + esc(d.warn) + '</span>' : ''}</p>` + chart +
       `<div class="size">${blocked ? 'Spot-only mode is on: do not short — stay out of this market.' :
-        `Size for ${S.settings.riskPct}% risk: <b>${fmt(z.qty)}</b> units ≈ ${usd(z.notional)} · risking ${usd(z.risk)}${z.note ? `<br><span class="mute">${z.note}</span>` : ''}
+        `${sizeLine(z, 1)}
          <div style="margin-top:10px"><button class="btn primary" id="aStage">Stage paper trade</button></div>`}</div>`;
   } else {
     chart = spark({closes: d.closes, setup: 1, stop: d.sup, target: d.res});
-    body = `<p style="margin:0 0 4px">The factors disagree, so there is no trade right now. Act only if one of these triggers fires:</p>
+    body = `<p style="margin:0 0 4px">${d.lock ? `<b style="color:var(--warn)">${esc(d.lock)}</b> After that, act` : 'The factors disagree, so there is no trade right now. Act'} only if one of these triggers fires:</p>
       <b class="up">Buy if a ${d.sp.lo} candle closes above ${fmt(d.res)}</b>${lv(d.buyTrig, 'Entry')}
       <b class="down">Sell if a ${d.sp.lo} candle closes below ${fmt(d.sup)}</b>${lv(d.sellTrig, 'Entry')}` + chart;
   }
@@ -422,6 +500,8 @@ function reportHTML(d) {
       <span class="mute">${p ? `Confidence ${d.conf}/100 · ` : ''}score ${d.score > 0 ? '+' : ''}${d.score.toFixed(1)} · ADX ${d.adx.toFixed(0)}${d.ranging ? ' (ranging)' : ''} · support ${fmt(d.sup)} · resistance ${fmt(d.res)}</span></div></div>
     ${p && guard(d.sym) ? `<p style="color:var(--warn);font-weight:600;margin:6px 0">⚠ ${esc(guard(d.sym))}</p>` : ''}
     ${body}
+    <div class="size" style="white-space:pre-line${d.news && d.news.length ? ';color:var(--warn)' : ''}">${esc(newsText(d))}</div>
+    ${MK[d.sym].g !== 'Crypto' ? '<div class="mute" style="font-size:12px;margin-top:8px">Your broker’s price can differ by a few pips from this feed. Keep the same stop and target distances from your real entry.</div>' : ''}
     <div class="cols"><div><h5>For a buy</h5><ul>${li(d.F.filter(f => f.p > 0))}</ul></div><div><h5>For a sell</h5><ul>${li(d.F.filter(f => f.p < 0))}</ul></div></div>
     ${d.F.some(f => !f.p) ? `<div class="mute" style="font-size:13px">Neutral: ${d.F.filter(f => !f.p).map(f => esc(f.t)).join(' · ')}</div>` : ''}</div>`;
 }
@@ -461,15 +541,26 @@ function stats() {
   return {closed, open, equity: eq, curve, maxDD, today, unreal, by,
     winRate: closed.length ? wins / closed.length * 100 : null, pf: gl ? gw / gl : (gw ? Infinity : null), avgR: closed.length ? rSum / closed.length : null};
 }
-function upnl(t) { const p = prices[t.sym]; return p == null ? 0 : (t.side === 'BUY' ? p - t.entry : t.entry - p) * t.qty; }
-function sizeFor(entry, stop) {
-  const eq = stats().equity, risk = eq * S.settings.riskPct / 100, dist = Math.abs(entry - stop);
-  let qty = risk / dist, note = '';
-  if (qty * entry > eq) {
-    if (S.settings.spotOnly) { qty = eq / entry; note = 'Capped at account size (spot-only), so actual risk is lower.'; }
-    else note = `Needs about ${(qty * entry / eq).toFixed(1)}× leverage — the stop is tight relative to price.`;
+function upnl(t) { const p = prices[t.sym], k = q2usd(t.sym); return p == null || !isFinite(k) ? 0 : (t.side === 'BUY' ? p - t.entry : t.entry - p) * t.qty * k; }
+function sizeFor(entry, stop, sym) {
+  const m = MK[sym] || {}, k = isFinite(q2usd(sym)) ? q2usd(sym) : 1, eq = stats().equity, risk = eq * S.settings.riskPct / 100, dist = Math.abs(entry - stop);
+  let qty = risk / (dist * k), note = '';
+  if (qty * entry * k > eq) {
+    if (S.settings.spotOnly) { qty = eq / (entry * k); note = 'Capped at account size (spot-only), so actual risk is lower.'; }
+    else note = `Needs about ${(qty * entry * k / eq).toFixed(1)}× leverage.`;
   }
-  return {qty, notional: qty * entry, risk: qty * dist, note};
+  const z = {qty, notional: qty * entry * k, risk: qty * dist * k, note};
+  if (m.lot > 1) { z.lots = Math.floor(qty / m.lot * 100) / 100; z.minRisk = .01 * m.lot * dist * k; z.minPct = z.minRisk / eq * 100; }
+  if (m.g === 'Forex') z.pips = Math.round(dist / (m.cur[1] === 'JPY' ? .01 : .0001));
+  return z;
+}
+// One description of the size, used by cards (html) and chat (text).
+function sizeLine(z, html) {
+  const b = x => html ? `<b>${x}</b>` : x, nl = html ? '<br>' : '\n';
+  let s = `Size for ${S.settings.riskPct}% risk: ${b(fmt(z.qty))} units ≈ ${usd(z.notional)} · risking ${usd(z.risk)}`;
+  if (z.lots != null) s += nl + (z.lots >= .01 ? `MT5 volume: ${b(z.lots.toFixed(2) + ' lots')}` : `Below MT5's 0.01 minimum lot — 0.01 lots would risk ${usd(z.minRisk)} (${z.minPct.toFixed(1)}% of your equity). Too big for this account: skip it.`) + (z.pips ? ` · stop distance ${z.pips} pips` : '');
+  if (z.note) s += nl + (html ? `<span class="mute">${z.note}</span>` : z.note);
+  return s;
 }
 function openTrade(o) {
   S.trades.push({id: Date.now() + '-' + Math.random().toString(36).slice(2, 7), status: 'open', openedAt: Date.now(), ...o});
@@ -478,8 +569,9 @@ function openTrade(o) {
 function closeTrade(id, exit) {
   const t = S.trades.find(x => x.id === id); if (!t || t.status !== 'open' || !(exit > 0)) return;
   t.exit = exit; t.closedAt = Date.now(); t.status = 'closed';
-  t.pnl = (t.side === 'BUY' ? exit - t.entry : t.entry - exit) * t.qty;
-  const riskAmt = Math.abs(t.entry - t.stop) * t.qty; t.r = riskAmt ? t.pnl / riskAmt : 0;
+  const k = isFinite(q2usd(t.sym)) ? q2usd(t.sym) : 1;
+  t.pnl = (t.side === 'BUY' ? exit - t.entry : t.entry - exit) * t.qty * k;
+  const riskAmt = Math.abs(t.entry - t.stop) * t.qty * k; t.r = riskAmt ? t.pnl / riskAmt : 0;
   save();
 }
 function checkExits() {
@@ -504,13 +596,13 @@ function cardHTML(a, i) {
   if (a.error) return `<div class="card">${head}</h3><p class="err">${esc(a.error)}</p></div>`;
   const biasCls = a.bias === 'Bullish' ? 'up' : a.bias === 'Bearish' ? 'down' : 'mute';
   if (!a.setup) return `<div class="card">${head}</h3><p class="mute" style="margin:8px 0 0">No setup — stand aside. Price ${fmt(a.price)} · Bias <span class="${biasCls}">${a.bias}</span> · RSI ${a.rsi.toFixed(0)}</p>${spark(a)}</div>`;
-  const blocked = S.settings.spotOnly && a.side === 'SELL', z = sizeFor(a.entry, a.stop);
+  const blocked = S.settings.spotOnly && a.side === 'SELL', z = sizeFor(a.entry, a.stop, a.sym);
   return `<div class="card">${head} <span class="tag ${a.side === 'BUY' ? 'buy' : 'sell'}">${a.side}</span> <span class="tag">${a.setup}</span></h3>
     <div class="lv"><div><small>Entry</small><b>${fmt(a.entry)}</b></div><div><small>Stop</small><b class="down">${fmt(a.stop)}</b></div><div><small>Target (${a.rr}R)</small><b class="up">${fmt(a.target)}</b></div></div>
     <div>Confluence <b>${a.score}</b>/100 · Bias <span class="${biasCls}">${a.bias}</span></div>
     <ul>${a.why.map(w => `<li>${esc(w)}</li>`).join('')}</ul>${spark(a)}
     <div class="size">${blocked ? 'Short setup — hidden from trading in spot-only mode.' :
-      `Size for ${S.settings.riskPct}% risk: <b>${fmt(z.qty)}</b> units ≈ ${usd(z.notional)} · risking ${usd(z.risk)}${z.note ? `<br><span class="mute">${z.note}</span>` : ''}
+      `${sizeLine(z, 1)}
        <div style="margin-top:10px"><button class="btn primary" data-stage="${i}">Stage paper trade</button></div>`}</div></div>`;
 }
 function renderCards() {
@@ -550,7 +642,7 @@ async function scan(tf = S.settings.tf, syms = MARKETS.map(m => m.s)) {
 }
 function stage(a) {
   if (S.settings.spotOnly && a.side === 'SELL') return false;
-  const z = sizeFor(a.entry, a.stop);
+  const z = sizeFor(a.entry, a.stop, a.sym);
   openTrade({sym: a.sym, side: a.side, setup: a.setup, entry: a.entry, stop: a.stop, target: a.target, qty: z.qty}); return true;
 }
 
@@ -560,10 +652,10 @@ function findSym(q) { for (const m of MARKETS) if (m.a.some(a => new RegExp('\\b
 function describe(a) {
   if (a.error) return `${nameOf(a.sym)}: ${a.error}`;
   if (!a.setup) return `${nameOf(a.sym)} (${a.tf}): no setup right now — stand aside.\nPrice ${fmt(a.price)}, bias ${a.bias}, RSI ${a.rsi.toFixed(0)}.`;
-  const z = sizeFor(a.entry, a.stop);
+  const z = sizeFor(a.entry, a.stop, a.sym);
   return `${nameOf(a.sym)} (${a.tf}): ${a.side} — ${a.setup}, confluence ${a.score}/100\nEntry ${fmt(a.entry)} · Stop ${fmt(a.stop)} · Target ${fmt(a.target)} (${a.rr}R)\n` +
     a.why.map(w => '• ' + w).join('\n') + (S.settings.spotOnly && a.side === 'SELL' ? '\nSpot-only mode is on, so this short is not tradable.' :
-    `\nSize at ${S.settings.riskPct}% risk: ${fmt(z.qty)} units ≈ ${usd(z.notional)}, risking ${usd(z.risk)}.${z.note ? ' ' + z.note : ''}`);
+    '\n' + sizeLine(z));
 }
 async function answer(raw) {
   const q = raw.toLowerCase(), sym = findSym(q), tf = (q.match(/\b(15m|1h|4h|1d)\b/) || [])[1] || S.settings.tf, st = stats();
@@ -573,6 +665,11 @@ async function answer(raw) {
     return hits.length ? `Scanned ${out.length} markets on ${tf}. ${hits.length} setup(s):\n\n` + hits.map(describe).join('\n\n') : `Scanned ${out.length} markets on ${tf}: nothing meets the rules. Standing aside is a position too.`;
   }
   const style = (q.match(/\b(scalp|intraday|swing)\b/) || [])[1] || ({'15m': 'scalp', '1h': 'intraday', '4h': 'swing', '1d': 'swing'})[(q.match(/\b(15m|1h|4h|1d)\b/) || [])[1]] || $('aStyle').value;
+  if (/\b(news|calendar|events?)\b/.test(q)) {
+    const ev = newsFor(sym, 48);
+    if (!ev) return 'The news calendar is unavailable right now. Check an economic calendar yourself before trading.';
+    return ev.length ? `High-impact releases in the next 48h${sym ? ' for ' + nameOf(sym) : ''}:\n` + ev.map(e => '• ' + newsLine(e)).join('\n') + '\n\nI only track scheduled economic data. I do not read headlines or surprise events.' : `No high-impact release in the next 48h${sym ? ' for ' + nameOf(sym) : ''}.`;
+  }
   if (sym) { const d = await deep(sym, style); renderPortfolio(); return deepText(d); }
   if (/what (should|to|do) (i )?(trade|buy|sell|do)|best (trade|opportunity|market|one)|top pick|what now/.test(q)) {
     const {all, best} = await bestNow(style); renderPortfolio();
@@ -590,7 +687,7 @@ async function answer(raw) {
   if (/win|p&l|pnl|profit|doing|performance|stats|today|equity/.test(q)) return st.closed.length ?
     `Equity ${usd(st.equity + st.unreal)} (open P&L ${usd(st.unreal)}). Realised today: ${usd(st.today)}.\n${st.closed.length} closed trades · win rate ${st.winRate.toFixed(0)}% · profit factor ${st.pf === Infinity ? '∞' : st.pf.toFixed(2)} · average ${st.avgR.toFixed(2)}R · max drawdown ${st.maxDD.toFixed(1)}%.` +
     (st.closed.length < 20 ? '\nFewer than 20 trades — too small a sample to trust these numbers yet.' : '') : `Equity ${usd(st.equity + st.unreal)}. No closed trades yet, so there are no stats to report.`;
-  return 'I did not catch that. I can read markets (BTC, ETH, SOL, BNB, XRP, ADA, gold, EUR), size trades and report on your portfolio. Type “help” for examples.';
+  return 'I did not catch that. I can read markets (EURUSD, GBPUSD, USDJPY, AUDCAD and other forex pairs, gold, BTC, ETH, SOL…), list news, size trades and report on your portfolio. Type “help” for examples.';
 }
 async function ask(text) {
   text = text.trim(); if (!text) return; say(text, 'me'); $('q').value = '';
@@ -601,7 +698,7 @@ async function ask(text) {
 $('nav').onclick = e => { const v = e.target.dataset.v; if (!v) return;
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b === e.target));
   document.querySelectorAll('section').forEach(s => s.classList.toggle('on', s.id === v)); };
-$('aSym').innerHTML = MARKETS.map(m => `<option value="${m.s}">${esc(m.n)}</option>`).join('');
+$('aSym').innerHTML = ['Forex', 'Metals', 'Crypto'].map(g => `<optgroup label="${g}">${MARKETS.filter(m => m.g === g).map(m => `<option value="${m.s}">${esc(m.n)}</option>`).join('')}</optgroup>`).join('');
 $('aStyle').value = S.settings.style || 'intraday';
 $('aStyle').onchange = () => { S.settings.style = $('aStyle').value; save(); };
 $('aGo').onclick = () => runDeep($('aSym').value, $('aStyle').value).then(renderPortfolio);
@@ -645,7 +742,8 @@ $('reset').onclick = () => { if (confirm('Delete all trades and settings stored 
 
 fillSettings(); renderAll();
 say('Hi — I am the OpenDesk assistant. Ask for a signal, a position size, or how your trading is going. Type “help” for examples.');
-scan(); runBest($('aStyle').value); setInterval(refreshPrices, 15000);
+Promise.all([loadNews(), refreshPrices()]).then(() => { scan(); runBest($('aStyle').value); });
+setInterval(refreshPrices, 15000); setInterval(loadNews, 30 * 6e4);
 </script>
 </body>
 </html>
